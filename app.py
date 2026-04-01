@@ -9,63 +9,74 @@ st.title("📊 Dalal Street Scanner")
 stocks = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS"]
 
 @st.cache_data
-def fetch_data():
-    frames = []
+def build_summary():
+    rows = []
 
     for stock in stocks:
-        df = yf.download(stock, period="1y", interval="1d", progress=False, auto_adjust=False)
+        try:
+            df = yf.download(
+                stock,
+                period="1y",
+                interval="1d",
+                progress=False,
+                auto_adjust=False
+            )
 
-        if df is None or df.empty:
+            if df is None or df.empty:
+                continue
+
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            df = df.reset_index()
+
+            required_cols = ["Date", "Open", "High", "Low", "Close", "Volume"]
+            missing = [c for c in required_cols if c not in df.columns]
+            if missing:
+                continue
+
+            for col in ["Open", "High", "Low", "Close", "Volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            df = df.dropna(subset=["High", "Low", "Close"]).copy()
+
+            if len(df) < 30:
+                continue
+
+            df["EMA_200"] = df["Close"].ewm(span=200, adjust=False).mean()
+            df["RSI"] = ta.momentum.rsi(df["Close"], window=14)
+            df["ADX"] = ta.trend.adx(df["High"], df["Low"], df["Close"], window=14)
+            df["Above_200"] = df["Close"] > df["EMA_200"]
+
+            last = df.iloc[-1]
+
+            rows.append({
+                "Stock": stock,
+                "Date": last["Date"],
+                "Close": round(float(last["Close"]), 2) if pd.notna(last["Close"]) else None,
+                "EMA_200": round(float(last["EMA_200"]), 2) if pd.notna(last["EMA_200"]) else None,
+                "RSI": round(float(last["RSI"]), 2) if pd.notna(last["RSI"]) else None,
+                "ADX": round(float(last["ADX"]), 2) if pd.notna(last["ADX"]) else None,
+                "Volume": int(last["Volume"]) if pd.notna(last["Volume"]) else None,
+                "Above_200": bool(last["Above_200"]) if pd.notna(last["Above_200"]) else False
+            })
+
+        except Exception:
             continue
 
-        # Flatten columns if yfinance returns MultiIndex columns
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        df = df.reset_index()
-        df["Stock"] = stock
-
-        needed = ["Date", "Open", "High", "Low", "Close", "Volume", "Stock"]
-        df = df[[c for c in needed if c in df.columns]]
-
-        frames.append(df)
-
-    if not frames:
+    if not rows:
         return pd.DataFrame()
 
-    return pd.concat(frames, ignore_index=True)
+    return pd.DataFrame(rows)
 
-df = fetch_data()
+latest = build_summary()
 
-if df.empty:
+if latest.empty:
     st.error("No market data could be fetched right now.")
     st.stop()
 
-# Ensure numeric columns are numeric
-for col in ["Open", "High", "Low", "Close", "Volume"]:
-    if col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-df = df.sort_values(["Stock", "Date"]).reset_index(drop=True)
-
-# Indicators per stock
-def add_indicators(group):
-    group = group.copy()
-    group["EMA_200"] = group["Close"].ewm(span=200, adjust=False).mean()
-    group["RSI"] = ta.momentum.rsi(group["Close"], window=14)
-    group["ADX"] = ta.trend.adx(group["High"], group["Low"], group["Close"], window=14)
-    group["Above_200"] = group["Close"] > group["EMA_200"]
-    return group
-
-df = df.groupby("Stock", group_keys=False).apply(add_indicators)
-
-latest = df.groupby("Stock", group_keys=False).tail(1).copy()
-
 st.subheader("📊 Screener")
-st.dataframe(
-    latest[["Stock", "Date", "Close", "EMA_200", "RSI", "ADX", "Volume", "Above_200"]],
-    use_container_width=True
-)
+st.dataframe(latest, use_container_width=True)
 
 st.subheader("🎯 Focus List")
 focus = latest[
@@ -74,10 +85,7 @@ focus = latest[
     (latest["ADX"] > 20)
 ].copy()
 
-st.dataframe(
-    focus[["Stock", "Date", "Close", "EMA_200", "RSI", "ADX", "Volume"]],
-    use_container_width=True
-)
+st.dataframe(focus, use_container_width=True)
 
 st.download_button(
     "Download Screener CSV",
