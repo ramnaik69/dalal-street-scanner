@@ -1,95 +1,106 @@
 import streamlit as st
 import pandas as pd
-import yfinance as yf
-import ta
 
-st.set_page_config(layout="wide")
+from data_fetcher import fetch_market_data, compute_relative_strength
+from config import INDEX_MAP, RETURN_WINDOWS, VOLUME_WINDOWS
+
+st.set_page_config(page_title="Dalal Street Scanner", layout="wide")
 st.title("📊 Dalal Street Scanner")
 
-stocks = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS"]
+@st.cache_data(ttl=3600, show_spinner=True)
+def load_data(force_refresh=False):
+    return fetch_market_data(force_refresh=force_refresh)
 
-@st.cache_data
-def build_summary():
-    rows = []
+col1, col2 = st.columns([1, 2])
+with col1:
+    refresh_clicked = st.button("🔄 Refresh data")
+with col2:
+    benchmark = st.selectbox("Benchmark", list(INDEX_MAP.keys()), index=0)
 
-    for stock in stocks:
-        try:
-            df = yf.download(
-                stock,
-                period="1y",
-                interval="1d",
-                progress=False,
-                auto_adjust=False
-            )
-
-            if df is None or df.empty:
-                continue
-
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-
-            df = df.reset_index()
-
-            required_cols = ["Date", "Open", "High", "Low", "Close", "Volume"]
-            missing = [c for c in required_cols if c not in df.columns]
-            if missing:
-                continue
-
-            for col in ["Open", "High", "Low", "Close", "Volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-            df = df.dropna(subset=["High", "Low", "Close"]).copy()
-
-            if len(df) < 30:
-                continue
-
-            df["EMA_200"] = df["Close"].ewm(span=200, adjust=False).mean()
-            df["RSI"] = ta.momentum.rsi(df["Close"], window=14)
-            df["ADX"] = ta.trend.adx(df["High"], df["Low"], df["Close"], window=14)
-            df["Above_200"] = df["Close"] > df["EMA_200"]
-
-            last = df.iloc[-1]
-
-            rows.append({
-                "Stock": stock,
-                "Date": last["Date"],
-                "Close": round(float(last["Close"]), 2) if pd.notna(last["Close"]) else None,
-                "EMA_200": round(float(last["EMA_200"]), 2) if pd.notna(last["EMA_200"]) else None,
-                "RSI": round(float(last["RSI"]), 2) if pd.notna(last["RSI"]) else None,
-                "ADX": round(float(last["ADX"]), 2) if pd.notna(last["ADX"]) else None,
-                "Volume": int(last["Volume"]) if pd.notna(last["Volume"]) else None,
-                "Above_200": bool(last["Above_200"]) if pd.notna(last["Above_200"]) else False
-            })
-
-        except Exception:
-            continue
-
-    if not rows:
-        return pd.DataFrame()
-
-    return pd.DataFrame(rows)
-
-latest = build_summary()
-
-if latest.empty:
-    st.error("No market data could be fetched right now.")
+try:
+    raw_df, summary_df, index_df, meta = load_data(force_refresh=refresh_clicked)
+except Exception as e:
+    st.error(f"Data load failed: {e}")
     st.stop()
 
-st.subheader("📊 Screener")
-st.dataframe(latest, use_container_width=True)
+st.caption(
+    f"Last refresh: {meta.get('last_refresh', 'NA')} | "
+    f"Fallback used: {meta.get('used_fallback', False)} | "
+    f"Stocks: {len(summary_df)}"
+)
 
-st.subheader("🎯 Focus List")
-focus = latest[
-    (latest["Above_200"] == True) &
-    (latest["RSI"] > 50) &
-    (latest["ADX"] > 20)
+rs_df = compute_relative_strength(summary_df, index_df, benchmark)
+
+focus_df = rs_df[
+    (rs_df["Above_200_SMA"] == True) &
+    (rs_df["Above_Jan_High"] == True) &
+    (rs_df["ADX_D"] > 20) &
+    (rs_df["RSI_D"] > 50) &
+    (rs_df["VOL_VS_5"] > 1) &
+    (rs_df["RS_55D_vs_Benchmark"] > 0)
 ].copy()
 
-st.dataframe(focus, use_container_width=True)
+adv = int((summary_df["RET_1D"] > 0).sum())
+dec = int((summary_df["RET_1D"] < 0).sum())
+unch = int((summary_df["RET_1D"] == 0).sum())
+ratio = round(adv / dec, 2) if dec else None
 
-st.download_button(
-    "Download Screener CSV",
-    latest.to_csv(index=False).encode("utf-8"),
-    "screener.csv",
-    "text/csv"
-)
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Advances", adv)
+m2.metric("Declines", dec)
+m3.metric("Unchanged", unch)
+m4.metric("A/D Ratio", ratio if ratio is not None else "NA")
+
+tab1, tab2, tab3, tab4 = st.tabs(["Screener", "Focus List", "Indices", "Relative Strength"])
+
+with tab1:
+    screener_cols = [
+        "Symbol", "Name", "Exchange", "Date", "Close",
+        "EMA_13", "EMA_21", "EMA_50", "EMA_100", "EMA_200", "SMA_200",
+        "Above_200_SMA",
+        "RSI_D", "ADX_D", "MACD_D",
+        "JAN_HIGH", "JAN_LOW", "Above_Jan_High", "Below_Jan_Low",
+        "PIVOT_D"
+    ]
+    screener_cols += [f"RET_{w}D" for w in RETURN_WINDOWS]
+    screener_cols += [f"VOL_VS_{w}" for w in VOLUME_WINDOWS]
+
+    view = summary_df[screener_cols].copy()
+    st.dataframe(view, use_container_width=True, height=520)
+
+    st.download_button(
+        "Download Screener CSV",
+        view.to_csv(index=False).encode("utf-8"),
+        "dalal_street_screener.csv",
+        "text/csv"
+    )
+
+with tab2:
+    st.dataframe(focus_df, use_container_width=True, height=500)
+    st.download_button(
+        "Download Focus List CSV",
+        focus_df.to_csv(index=False).encode("utf-8"),
+        "dalal_street_focus_list.csv",
+        "text/csv"
+    )
+
+with tab3:
+    st.dataframe(index_df, use_container_width=True, height=420)
+    if not index_df.empty:
+        st.download_button(
+            "Download Indices CSV",
+            index_df.to_csv(index=False).encode("utf-8"),
+            "dalal_street_indices.csv",
+            "text/csv"
+        )
+
+with tab4:
+    rs_cols = [
+        "Symbol", "Name", "Exchange", "Close",
+        "RET_1D", "RET_21D", "RET_55D", "RET_123D", "RET_180D",
+        "RS_1D_vs_Benchmark", "RS_21D_vs_Benchmark",
+        "RS_55D_vs_Benchmark", "RS_123D_vs_Benchmark", "RS_180D_vs_Benchmark",
+        "Above_200_SMA", "Above_Jan_High", "RSI_D", "ADX_D"
+    ]
+    rs_view = rs_df[rs_cols].sort_values("RS_55D_vs_Benchmark", ascending=False)
+    st.dataframe(rs_view, use_container_width=True, height=500)
