@@ -17,14 +17,17 @@ from config import (
 )
 from indicators import build_latest_summary, add_indicators
 
+
 def load_symbols():
     df = pd.read_csv(SYMBOLS_FILE)
     return df
+
 
 def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df
+
 
 def fetch_one(yahoo_symbol: str) -> pd.DataFrame:
     df = yf.download(
@@ -45,6 +48,7 @@ def fetch_one(yahoo_symbol: str) -> pd.DataFrame:
     needed = ["Date", "Open", "High", "Low", "Close", "Volume"]
     keep = [c for c in needed if c in df.columns]
     return df[keep].copy()
+
 
 def fetch_index_summaries():
     rows = []
@@ -73,6 +77,7 @@ def fetch_index_summaries():
         except Exception:
             continue
     return pd.DataFrame(rows)
+
 
 def fetch_market_data(force_refresh: bool = False):
     symbols = load_symbols()
@@ -139,11 +144,16 @@ def fetch_market_data(force_refresh: bool = False):
     META_FILE.write_text(json.dumps(meta, indent=2))
     return raw, summary, idx_summary, meta
 
+
 def compute_relative_strength(summary_df: pd.DataFrame, index_df: pd.DataFrame, benchmark_name: str):
     bench = index_df[index_df["Index"] == benchmark_name]
     out = summary_df.copy()
     if bench.empty:
         out["RS_55D_vs_Benchmark"] = None
+        out["RS_1D_vs_Benchmark"] = None
+        out["RS_21D_vs_Benchmark"] = None
+        out["RS_123D_vs_Benchmark"] = None
+        out["RS_180D_vs_Benchmark"] = None
         return out
 
     bench_row = bench.iloc[0]
