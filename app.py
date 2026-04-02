@@ -7,9 +7,11 @@ from config import INDEX_MAP, RETURN_WINDOWS, VOLUME_WINDOWS
 st.set_page_config(page_title="Dalal Street Scanner", layout="wide")
 st.title("📊 Dalal Street Scanner")
 
+
 @st.cache_data(ttl=3600, show_spinner=True)
 def load_data(force_refresh=False):
     return fetch_market_data(force_refresh=force_refresh)
+
 
 col1, col2 = st.columns([1, 2])
 with col1:
@@ -28,6 +30,9 @@ st.caption(
     f"Fallback used: {meta.get('used_fallback', False)} | "
     f"Stocks: {len(summary_df)}"
 )
+
+summary_df = summary_df.loc[:, ~summary_df.columns.duplicated()].copy()
+index_df = index_df.loc[:, ~index_df.columns.duplicated()].copy()
 
 rs_df = compute_relative_strength(summary_df, index_df, benchmark)
 
@@ -65,7 +70,9 @@ with tab1:
     screener_cols += [f"RET_{w}D" for w in RETURN_WINDOWS]
     screener_cols += [f"VOL_VS_{w}" for w in VOLUME_WINDOWS]
 
+    screener_cols = [c for c in screener_cols if c in summary_df.columns]
     view = summary_df[screener_cols].copy()
+
     st.dataframe(view, use_container_width=True, height=520)
 
     st.download_button(
@@ -102,9 +109,10 @@ with tab4:
         "RS_55D_vs_Benchmark", "RS_123D_vs_Benchmark", "RS_180D_vs_Benchmark",
         "Above_200_SMA", "Above_Jan_High", "RSI_D", "ADX_D"
     ]
-    rs_view = rs_df[rs_cols].sort_values("RS_55D_vs_Benchmark", ascending=False)
-    st.dataframe(rs_view, use_container_width=True, height=500)
+    rs_cols = [c for c in rs_cols if c in rs_df.columns]
+    rs_view = rs_df[rs_cols].copy()
 
-@st.cache_data(ttl=3600, show_spinner=True)
-def load_data(force_refresh=False):
-    return fetch_market_data(force_refresh=force_refresh)
+    if "RS_55D_vs_Benchmark" in rs_view.columns:
+        rs_view = rs_view.sort_values("RS_55D_vs_Benchmark", ascending=False)
+
+    st.dataframe(rs_view, use_container_width=True, height=500)
