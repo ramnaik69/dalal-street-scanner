@@ -1,6 +1,7 @@
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+
 import pandas as pd
 import yfinance as yf
 
@@ -20,12 +21,8 @@ from indicators import build_latest_summary, add_indicators
 
 def load_symbols():
     df = pd.read_csv(SYMBOLS_FILE)
-    return df
-
-
-def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    df = df.loc[:, ~df.columns.duplicated()]
+    df = df.drop_duplicates(subset=["Symbol"], keep="first").reset_index(drop=True)
     return df
 
 
@@ -38,32 +35,51 @@ def fetch_one(yahoo_symbol: str) -> pd.DataFrame:
         auto_adjust=False,
         threads=False,
     )
+
     if df is None or df.empty:
         return pd.DataFrame()
 
-    df = flatten_columns(df).reset_index()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    df = df.reset_index()
+    df = df.loc[:, ~df.columns.duplicated()]
+
     if "Date" not in df.columns:
         return pd.DataFrame()
 
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"])
+    df = df.drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
+
     needed = ["Date", "Open", "High", "Low", "Close", "Volume"]
     keep = [c for c in needed if c in df.columns]
-    return df[keep].copy()
+
+    out = df[keep].copy()
+    out = out.loc[:, ~out.columns.duplicated()]
+    return out
 
 
 def fetch_index_summaries():
     rows = []
+
     for index_name, ticker in INDEX_MAP.items():
         try:
             df = fetch_one(ticker)
             if df.empty:
                 continue
+
             df = add_indicators(df)
+            if df.empty:
+                continue
+
             last = df.iloc[-1]
+
             row = {
                 "Index": index_name,
                 "Ticker": ticker,
                 "Date": last["Date"],
-                "Close": round(float(last["Close"]), 2),
+                "Close": round(float(last["Close"]), 2) if pd.notna(last["Close"]) else None,
                 "RSI_D": round(float(last["RSI_D"]), 2) if pd.notna(last["RSI_D"]) else None,
                 "ADX_D": round(float(last["ADX_D"]), 2) if pd.notna(last["ADX_D"]) else None,
                 "PIVOT_D": round(float(last["PIVOT_D"]), 2) if pd.notna(last["PIVOT_D"]) else None,
@@ -76,7 +92,11 @@ def fetch_index_summaries():
             rows.append(row)
         except Exception:
             continue
-    return pd.DataFrame(rows)
+
+    idx_df = pd.DataFrame(rows)
+    if not idx_df.empty:
+        idx_df = idx_df.drop_duplicates(subset=["Index"], keep="first").reset_index(drop=True)
+    return idx_df
 
 
 def fetch_market_data(force_refresh: bool = False):
@@ -96,6 +116,7 @@ def fetch_market_data(force_refresh: bool = False):
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         future_map = {}
+
         for row in symbols.itertuples(index=False):
             future = ex.submit(fetch_one, row.YahooSymbol)
             future_map[future] = row
@@ -112,15 +133,19 @@ def fetch_market_data(force_refresh: bool = False):
                 df["Name"] = row.Name
                 df["Exchange"] = row.Exchange
 
+                df = df.loc[:, ~df.columns.duplicated()]
                 raw_frames.append(df)
 
                 summary_row = build_latest_summary(
                     row.Symbol,
                     row.Name,
                     row.Exchange,
-                    df[["Date", "Open", "High", "Low", "Close", "Volume"]].copy()
+                    df[["Date", "Open", "High", "Low", "Close", "Volume"]].copy(),
                 )
-                summary_rows.append(summary_row)
+
+                if summary_row:
+                    summary_rows.append(summary_row)
+
             except Exception:
                 continue
 
@@ -128,8 +153,17 @@ def fetch_market_data(force_refresh: bool = False):
         raise RuntimeError("No market data fetched.")
 
     raw = pd.concat(raw_frames, ignore_index=True)
-    summary = pd.DataFrame(summary_rows).sort_values(["Exchange", "Symbol"]).reset_index(drop=True)
+    raw = raw.loc[:, ~raw.columns.duplicated()]
+    raw = raw.reset_index(drop=True)
+
+    summary = pd.DataFrame(summary_rows)
+    summary = summary.loc[:, ~summary.columns.duplicated()]
+    summary = summary.drop_duplicates(subset=["Symbol"], keep="first")
+    summary = summary.sort_values(["Exchange", "Symbol"]).reset_index(drop=True)
+
     idx_summary = fetch_index_summaries()
+    if idx_summary.empty:
+        idx_summary = pd.DataFrame(columns=["Index", "Ticker", "Date", "Close", "RSI_D", "ADX_D", "PIVOT_D"])
 
     raw.to_parquet(CACHE_FILE, index=False)
     summary.to_parquet(SUMMARY_FILE, index=False)
@@ -142,26 +176,36 @@ def fetch_market_data(force_refresh: bool = False):
         "rows_summary": int(len(summary)),
     }
     META_FILE.write_text(json.dumps(meta, indent=2))
+
     return raw, summary, idx_summary, meta
 
 
 def compute_relative_strength(summary_df: pd.DataFrame, index_df: pd.DataFrame, benchmark_name: str):
-    bench = index_df[index_df["Index"] == benchmark_name]
     out = summary_df.copy()
-    if bench.empty:
-        out["RS_55D_vs_Benchmark"] = None
+
+    if index_df.empty:
         out["RS_1D_vs_Benchmark"] = None
         out["RS_21D_vs_Benchmark"] = None
+        out["RS_55D_vs_Benchmark"] = None
+        out["RS_123D_vs_Benchmark"] = None
+        out["RS_180D_vs_Benchmark"] = None
+        return out
+
+    bench = index_df[index_df["Index"] == benchmark_name]
+    if bench.empty:
+        out["RS_1D_vs_Benchmark"] = None
+        out["RS_21D_vs_Benchmark"] = None
+        out["RS_55D_vs_Benchmark"] = None
         out["RS_123D_vs_Benchmark"] = None
         out["RS_180D_vs_Benchmark"] = None
         return out
 
     bench_row = bench.iloc[0]
+
     out["RS_1D_vs_Benchmark"] = out["RET_1D"] - bench_row.get("RET_1D", 0)
     out["RS_21D_vs_Benchmark"] = out["RET_21D"] - bench_row.get("RET_21D", 0)
     out["RS_55D_vs_Benchmark"] = out["RET_55D"] - bench_row.get("RET_55D", 0)
     out["RS_123D_vs_Benchmark"] = out["RET_123D"] - bench_row.get("RET_123D", 0)
     out["RS_180D_vs_Benchmark"] = out["RET_180D"] - bench_row.get("RET_180D", 0)
-    return out
 
-if CACHE_FILE.exists() and SUMMARY_FILE.exists() and INDEX_SUMMARY_FILE.exists() and not force_refresh:
+    return out
