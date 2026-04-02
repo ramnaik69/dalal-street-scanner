@@ -104,3 +104,7 @@ with tab4:
     ]
     rs_view = rs_df[rs_cols].sort_values("RS_55D_vs_Benchmark", ascending=False)
     st.dataframe(rs_view, use_container_width=True, height=500)
+
+@st.cache_data(ttl=3600, show_spinner=True)
+def load_data(force_refresh=False):
+    return fetch_market_data(force_refresh=force_refresh)
