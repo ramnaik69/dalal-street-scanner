@@ -90,7 +90,7 @@ def compute_htf(df: pd.DataFrame):
     return result
 
 
-def build_latest_summary(symbol, name, exchange, df):
+def build_latest_summary(symbol, name, exchange, df, fundamentals=None):
     df = add_indicators(df)
 
     if df.empty:
@@ -100,12 +100,25 @@ def build_latest_summary(symbol, name, exchange, df):
 
     htf = compute_htf(df)
 
+    fundamentals = fundamentals or {}
+    close = float(last["Close"])
+    high_52w = float(df.tail(252)["High"].max()) if not df.empty else np.nan
+    jan_start = pd.Timestamp(last["Date"]).replace(month=1, day=1)
+    jan_slice = df[df["Date"] >= jan_start]
+    jan_high = float(jan_slice["High"].max()) if not jan_slice.empty else np.nan
+
     return {
         "Symbol": symbol,
         "Name": name,
         "Exchange": exchange,
         "Date": last["Date"],
-        "Close": round(last["Close"], 2),
+        "Close": round(close, 2),
+        "High_52W": high_52w,
+        "Jan_High": jan_high,
+        "Within_15pct_52W_High": bool(close >= 0.85 * high_52w) if pd.notna(high_52w) else False,
+        "Above_Jan_High": bool(close > jan_high) if pd.notna(jan_high) else False,
+        "Daily_RSI_GT_50": bool(last["RSI_D"] > 50) if pd.notna(last["RSI_D"]) else False,
+        "Daily_ADX_GT_20": bool(last["ADX_D"] > 20) if pd.notna(last["ADX_D"]) else False,
 
         "EMA_13": last["EMA_13"],
         "EMA_21": last["EMA_21"],
@@ -129,4 +142,7 @@ def build_latest_summary(symbol, name, exchange, df):
         "ADX_M": htf["ADX_M"],
         "MACD_M": htf["MACD_M"],
         "PIVOT_M": htf["PIVOT_M"],
+        "MarketCap": fundamentals.get("MarketCap", np.nan),
+        "EPS": fundamentals.get("EPS", np.nan),
+        "BookValue": fundamentals.get("BookValue", np.nan),
     }

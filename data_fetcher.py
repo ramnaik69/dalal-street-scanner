@@ -1,12 +1,38 @@
 import pandas as pd
 import yfinance as yf
+import numpy as np
+import requests
+import json
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from config import SYMBOLS_FILE, HISTORY_PERIOD, INTERVAL
+from config import (
+    SYMBOLS_FILE,
+    HISTORY_PERIOD,
+    INTERVAL,
+    CACHE_FILE,
+    SUMMARY_FILE,
+    INDEX_SUMMARY_FILE,
+    META_FILE,
+)
 from indicators import build_latest_summary
 
 
-BULK_BATCH_SIZE = 80
+BULK_BATCH_SIZE = 20
+FALLBACK_BATCH_SIZE = 10
+HISTORY_WORKERS = 8
+FUNDAMENTAL_WORKERS = 12
+ENABLE_FUNDAMENTALS = False
+
+INDEX_ENDPOINTS = {
+    "NIFTY50": "NIFTY 50",
+    "NIFTY100": "NIFTY 100",
+    "NIFTY500": "NIFTY 500",
+    "NIFTYMIDCAP": "NIFTY MIDCAP 100",
+    "NIFTYSMALLCAP": "NIFTY SMALLCAP 100",
+    "NIFTYNEXT50": "NIFTY NEXT 50",
+    "NIFTYBANK": "NIFTY BANK",
+}
 
 
 def load_symbols():
@@ -75,11 +101,126 @@ def bulk_download_chunk(yahoo_symbols):
             progress=False,
             auto_adjust=False,
             group_by="ticker",
-            threads=False,
+            threads=True,
         )
         return data
     except Exception:
         return pd.DataFrame()
+
+
+def _fetch_single_chunk(batch):
+    return batch, bulk_download_chunk(batch)
+
+
+def _download_with_retry(batch, retries=2):
+    for _ in range(retries + 1):
+        bulk_df = bulk_download_chunk(batch)
+        if bulk_df is not None and not bulk_df.empty:
+            return bulk_df
+    return pd.DataFrame()
+
+
+def load_index_membership():
+    members = {name: set() for name in INDEX_ENDPOINTS.keys()}
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": "https://www.nseindia.com/",
+        }
+    )
+
+    try:
+        session.get("https://www.nseindia.com", timeout=10)
+    except Exception:
+        return members
+
+    for col_name, index_name in INDEX_ENDPOINTS.items():
+        try:
+            url = "https://www.nseindia.com/api/equity-stockIndices"
+            resp = session.get(url, params={"index": index_name}, timeout=12)
+            data = resp.json().get("data", [])
+            symbols = {
+                str(item.get("symbol", "")).strip()
+                for item in data
+                if item.get("symbol")
+            }
+            members[col_name] = symbols
+        except Exception:
+            members[col_name] = set()
+
+    return members
+
+
+def _safe_float(value):
+    try:
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return np.nan
+        return float(value)
+    except Exception:
+        return np.nan
+
+
+def fetch_fundamental_for_symbol(yahoo_symbol):
+    out = {"MarketCap": np.nan, "EPS": np.nan, "BookValue": np.nan}
+    try:
+        t = yf.Ticker(yahoo_symbol)
+        fast = getattr(t, "fast_info", {}) or {}
+        info = getattr(t, "info", {}) or {}
+
+        market_cap = fast.get("market_cap")
+        if market_cap is None:
+            market_cap = info.get("marketCap")
+
+        eps = info.get("trailingEps")
+        if eps is None:
+            eps = info.get("forwardEps")
+
+        book_value = info.get("bookValue")
+
+        out["MarketCap"] = _safe_float(market_cap)
+        out["EPS"] = _safe_float(eps)
+        out["BookValue"] = _safe_float(book_value)
+    except Exception:
+        pass
+    return yahoo_symbol, out
+
+
+def fetch_fundamentals_map(yahoo_symbols):
+    result = {ys: {"MarketCap": np.nan, "EPS": np.nan, "BookValue": np.nan} for ys in yahoo_symbols}
+    with ThreadPoolExecutor(max_workers=FUNDAMENTAL_WORKERS) as executor:
+        futures = [executor.submit(fetch_fundamental_for_symbol, ys) for ys in yahoo_symbols]
+        for fut in as_completed(futures):
+            ys, payload = fut.result()
+            result[ys] = payload
+    return result
+
+
+def export_outputs(summary_df):
+    export_df = summary_df.copy()
+    export_df.to_csv("data/screener_latest.csv", index=False)
+    export_df.to_html("data/screener_latest.html", index=False)
+
+
+def load_cached_outputs():
+    if not SUMMARY_FILE.exists() or not META_FILE.exists():
+        return None
+
+    raw_df = pd.read_parquet(CACHE_FILE) if CACHE_FILE.exists() else pd.DataFrame()
+    summary_df = pd.read_parquet(SUMMARY_FILE)
+    index_df = pd.read_parquet(INDEX_SUMMARY_FILE) if INDEX_SUMMARY_FILE.exists() else pd.DataFrame()
+    with open(META_FILE, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    return raw_df, summary_df, index_df, meta
+
+
+def save_cached_outputs(raw_df, summary_df, index_df, meta):
+    raw_df.to_parquet(CACHE_FILE, index=False)
+    summary_df.to_parquet(SUMMARY_FILE, index=False)
+    index_df.to_parquet(INDEX_SUMMARY_FILE, index=False)
+    with open(META_FILE, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
 
 
 def extract_symbol_df(bulk_df, yahoo_symbol):
@@ -102,6 +243,12 @@ def extract_symbol_df(bulk_df, yahoo_symbol):
 
 
 def fetch_market_data(force_refresh=False):
+    if not force_refresh:
+        cached = load_cached_outputs()
+        if cached is not None:
+            return cached
+        # First deploy or empty cache: fallback to live fetch path.
+
     symbols = load_symbols()
 
     raw_all = []
@@ -118,8 +265,53 @@ def fetch_market_data(force_refresh=False):
 
     yahoo_symbols = symbols["YahooSymbol"].tolist()
 
-    for batch in chunk_list(yahoo_symbols, BULK_BATCH_SIZE):
-        bulk_df = bulk_download_chunk(batch)
+    index_membership = load_index_membership()
+    fundamentals_map = (
+        fetch_fundamentals_map(yahoo_symbols)
+        if ENABLE_FUNDAMENTALS
+        else {ys: {"MarketCap": np.nan, "EPS": np.nan, "BookValue": np.nan} for ys in yahoo_symbols}
+    )
+
+    batches = list(chunk_list(yahoo_symbols, BULK_BATCH_SIZE))
+    with ThreadPoolExecutor(max_workers=HISTORY_WORKERS) as executor:
+        futures = [executor.submit(_fetch_single_chunk, batch) for batch in batches]
+        batch_results = [f.result() for f in as_completed(futures)]
+
+    for batch, bulk_df in batch_results:
+        if bulk_df is None or bulk_df.empty:
+            # Retry failed large batch as smaller 10-symbol chunks
+            small_batches = list(chunk_list(batch, FALLBACK_BATCH_SIZE))
+            for sb in small_batches:
+                bulk_df_sb = _download_with_retry(sb, retries=2)
+                if bulk_df_sb is None or bulk_df_sb.empty:
+                    continue
+                for ys in sb:
+                    try:
+                        df = extract_symbol_df(bulk_df_sb, ys)
+                        if df.empty:
+                            continue
+
+                        meta = symbol_map[ys]
+                        fundamentals = fundamentals_map.get(ys, {})
+                        df["Symbol"] = meta["Symbol"]
+                        df["Name"] = meta["Name"]
+                        df["Exchange"] = meta["Exchange"]
+                        raw_all.append(df)
+
+                        summary = build_latest_summary(
+                            meta["Symbol"],
+                            meta["Name"],
+                            meta["Exchange"],
+                            df[["Date", "Open", "High", "Low", "Close", "Volume"]].copy(),
+                            fundamentals=fundamentals,
+                        )
+                        if summary:
+                            for membership_col, symbols_set in index_membership.items():
+                                summary[membership_col] = meta["Symbol"] in symbols_set
+                            summary_all.append(summary)
+                    except Exception:
+                        continue
+            continue
 
         for ys in batch:
             try:
@@ -128,6 +320,7 @@ def fetch_market_data(force_refresh=False):
                     continue
 
                 meta = symbol_map[ys]
+                fundamentals = fundamentals_map.get(ys, {})
 
                 df["Symbol"] = meta["Symbol"]
                 df["Name"] = meta["Name"]
@@ -140,9 +333,12 @@ def fetch_market_data(force_refresh=False):
                     meta["Name"],
                     meta["Exchange"],
                     df[["Date", "Open", "High", "Low", "Close", "Volume"]].copy(),
+                    fundamentals=fundamentals,
                 )
 
                 if summary:
+                    for membership_col, symbols_set in index_membership.items():
+                        summary[membership_col] = meta["Symbol"] in symbols_set
                     summary_all.append(summary)
 
             except Exception:
@@ -152,16 +348,26 @@ def fetch_market_data(force_refresh=False):
     total_symbols = len(symbols)
 
     if success_count == 0:
-        raise RuntimeError(
-            "Bulk Yahoo loader ran, but zero symbols fetched successfully."
-        )
+        meta = {
+            "last_refresh": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "symbols_loaded": total_symbols,
+            "symbols_succeeded": 0,
+            "batch_size": BULK_BATCH_SIZE,
+            "data_mode": "Live fallback attempted (no symbols fetched)",
+            "error": "No symbols fetched from provider. Try again or run scheduled updater later.",
+        }
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), meta
 
     raw_df = pd.concat(raw_all, ignore_index=True) if raw_all else pd.DataFrame()
     raw_df = raw_df.loc[:, ~raw_df.columns.duplicated()].copy()
 
     summary_df = pd.DataFrame(summary_all)
     summary_df = summary_df.loc[:, ~summary_df.columns.duplicated()].copy()
+    summary_df = summary_df.sort_values(["Symbol", "Date"], ascending=[True, False])
     summary_df = summary_df.drop_duplicates(subset=["Symbol"], keep="first").reset_index(drop=True)
+    summary_df = summary_df.sort_values("Symbol").reset_index(drop=True)
+
+    export_outputs(summary_df)
 
     index_df = pd.DataFrame()
 
@@ -170,8 +376,10 @@ def fetch_market_data(force_refresh=False):
         "symbols_loaded": total_symbols,
         "symbols_succeeded": success_count,
         "batch_size": BULK_BATCH_SIZE,
+        "data_mode": "EOD snapshot (post-close)",
     }
 
+    save_cached_outputs(raw_df, summary_df, index_df, meta)
     return raw_df, summary_df, index_df, meta
 
 
