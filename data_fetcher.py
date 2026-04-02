@@ -13,7 +13,6 @@ def load_symbols():
     if "Symbol" not in df.columns:
         raise RuntimeError("symbols.csv must contain a Symbol column")
 
-    # Auto-create YahooSymbol if missing
     if "YahooSymbol" not in df.columns:
         df["YahooSymbol"] = df["Symbol"].astype(str).str.strip() + ".NS"
     else:
@@ -21,7 +20,6 @@ def load_symbols():
             df["Symbol"].astype(str).str.strip() + ".NS"
         )
 
-    # Fill optional columns if missing
     if "Name" not in df.columns:
         df["Name"] = df["Symbol"]
     if "Exchange" not in df.columns:
@@ -71,11 +69,6 @@ def fetch_one(yahoo_symbol):
         return pd.DataFrame()
 
 
-def fetch_index_summaries():
-    # keep it simple for now
-    return pd.DataFrame()
-
-
 def fetch_market_data(force_refresh=False):
     symbols = load_symbols()
 
@@ -117,11 +110,11 @@ def fetch_market_data(force_refresh=False):
     total_symbols = len(symbols)
 
     if success_count == 0:
-        raise RuntimeError("No symbols fetched successfully. Check symbols.csv / Yahoo symbols.")
+        raise RuntimeError("V2 loader ran, but zero symbols fetched successfully.")
 
     raw_df = pd.concat(raw_all, ignore_index=True) if raw_all else pd.DataFrame()
     summary_df = pd.DataFrame(summary_all)
-    index_df = fetch_index_summaries()
+    index_df = pd.DataFrame()
 
     meta = {
         "last_refresh": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -134,33 +127,9 @@ def fetch_market_data(force_refresh=False):
 
 def compute_relative_strength(summary_df, index_df, benchmark_name):
     out = summary_df.copy()
-
     out["RS_1D_vs_Benchmark"] = None
     out["RS_21D_vs_Benchmark"] = None
     out["RS_55D_vs_Benchmark"] = None
     out["RS_123D_vs_Benchmark"] = None
     out["RS_180D_vs_Benchmark"] = None
-
-    if index_df is None or index_df.empty:
-        return out
-
-    if "Index" not in index_df.columns:
-        return out
-
-    bench = index_df[index_df["Index"] == benchmark_name]
-    if bench.empty:
-        return out
-
-    bench_row = bench.iloc[0]
-
-    for col in ["RET_1D", "RET_21D", "RET_55D", "RET_123D", "RET_180D"]:
-        if col not in out.columns:
-            out[col] = None
-
-    out["RS_1D_vs_Benchmark"] = out["RET_1D"] - bench_row.get("RET_1D", 0)
-    out["RS_21D_vs_Benchmark"] = out["RET_21D"] - bench_row.get("RET_21D", 0)
-    out["RS_55D_vs_Benchmark"] = out["RET_55D"] - bench_row.get("RET_55D", 0)
-    out["RS_123D_vs_Benchmark"] = out["RET_123D"] - bench_row.get("RET_123D", 0)
-    out["RS_180D_vs_Benchmark"] = out["RET_180D"] - bench_row.get("RET_180D", 0)
-
     return out
