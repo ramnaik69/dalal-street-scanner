@@ -1,12 +1,27 @@
 import pandas as pd
 import yfinance as yf
+import numpy as np
+import requests
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import SYMBOLS_FILE, HISTORY_PERIOD, INTERVAL
 from indicators import build_latest_summary
 
 
 BULK_BATCH_SIZE = 80
+HISTORY_WORKERS = 6
+FUNDAMENTAL_WORKERS = 12
+
+INDEX_ENDPOINTS = {
+    "NIFTY50": "NIFTY 50",
+    "NIFTY100": "NIFTY 100",
+    "NIFTY500": "NIFTY 500",
+    "NIFTYMIDCAP": "NIFTY MIDCAP 100",
+    "NIFTYSMALLCAP": "NIFTY SMALLCAP 100",
+    "NIFTYNEXT50": "NIFTY NEXT 50",
+    "NIFTYBANK": "NIFTY BANK",
+}
 
 
 def load_symbols():
@@ -75,11 +90,98 @@ def bulk_download_chunk(yahoo_symbols):
             progress=False,
             auto_adjust=False,
             group_by="ticker",
-            threads=False,
+            threads=True,
         )
         return data
     except Exception:
         return pd.DataFrame()
+
+
+def _fetch_single_chunk(batch):
+    return batch, bulk_download_chunk(batch)
+
+
+def load_index_membership():
+    members = {name: set() for name in INDEX_ENDPOINTS.keys()}
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": "https://www.nseindia.com/",
+        }
+    )
+
+    try:
+        session.get("https://www.nseindia.com", timeout=10)
+    except Exception:
+        return members
+
+    for col_name, index_name in INDEX_ENDPOINTS.items():
+        try:
+            url = "https://www.nseindia.com/api/equity-stockIndices"
+            resp = session.get(url, params={"index": index_name}, timeout=12)
+            data = resp.json().get("data", [])
+            symbols = {
+                str(item.get("symbol", "")).strip()
+                for item in data
+                if item.get("symbol")
+            }
+            members[col_name] = symbols
+        except Exception:
+            members[col_name] = set()
+
+    return members
+
+
+def _safe_float(value):
+    try:
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return np.nan
+        return float(value)
+    except Exception:
+        return np.nan
+
+
+def fetch_fundamental_for_symbol(yahoo_symbol):
+    out = {"MarketCap": np.nan, "EPS": np.nan, "BookValue": np.nan}
+    try:
+        t = yf.Ticker(yahoo_symbol)
+        fast = getattr(t, "fast_info", {}) or {}
+        info = getattr(t, "info", {}) or {}
+
+        market_cap = fast.get("market_cap")
+        if market_cap is None:
+            market_cap = info.get("marketCap")
+
+        eps = info.get("trailingEps")
+        if eps is None:
+            eps = info.get("forwardEps")
+
+        book_value = info.get("bookValue")
+
+        out["MarketCap"] = _safe_float(market_cap)
+        out["EPS"] = _safe_float(eps)
+        out["BookValue"] = _safe_float(book_value)
+    except Exception:
+        pass
+    return yahoo_symbol, out
+
+
+def fetch_fundamentals_map(yahoo_symbols):
+    result = {ys: {"MarketCap": np.nan, "EPS": np.nan, "BookValue": np.nan} for ys in yahoo_symbols}
+    with ThreadPoolExecutor(max_workers=FUNDAMENTAL_WORKERS) as executor:
+        futures = [executor.submit(fetch_fundamental_for_symbol, ys) for ys in yahoo_symbols]
+        for fut in as_completed(futures):
+            ys, payload = fut.result()
+            result[ys] = payload
+    return result
+
+
+def export_outputs(summary_df):
+    export_df = summary_df.copy()
+    export_df.to_csv("data/screener_latest.csv", index=False)
+    export_df.to_html("data/screener_latest.html", index=False)
 
 
 def extract_symbol_df(bulk_df, yahoo_symbol):
@@ -118,9 +220,15 @@ def fetch_market_data(force_refresh=False):
 
     yahoo_symbols = symbols["YahooSymbol"].tolist()
 
-    for batch in chunk_list(yahoo_symbols, BULK_BATCH_SIZE):
-        bulk_df = bulk_download_chunk(batch)
+    index_membership = load_index_membership()
+    fundamentals_map = fetch_fundamentals_map(yahoo_symbols)
 
+    batches = list(chunk_list(yahoo_symbols, BULK_BATCH_SIZE))
+    with ThreadPoolExecutor(max_workers=HISTORY_WORKERS) as executor:
+        futures = [executor.submit(_fetch_single_chunk, batch) for batch in batches]
+        batch_results = [f.result() for f in as_completed(futures)]
+
+    for batch, bulk_df in batch_results:
         for ys in batch:
             try:
                 df = extract_symbol_df(bulk_df, ys)
@@ -128,6 +236,7 @@ def fetch_market_data(force_refresh=False):
                     continue
 
                 meta = symbol_map[ys]
+                fundamentals = fundamentals_map.get(ys, {})
 
                 df["Symbol"] = meta["Symbol"]
                 df["Name"] = meta["Name"]
@@ -140,9 +249,12 @@ def fetch_market_data(force_refresh=False):
                     meta["Name"],
                     meta["Exchange"],
                     df[["Date", "Open", "High", "Low", "Close", "Volume"]].copy(),
+                    fundamentals=fundamentals,
                 )
 
                 if summary:
+                    for membership_col, symbols_set in index_membership.items():
+                        summary[membership_col] = meta["Symbol"] in symbols_set
                     summary_all.append(summary)
 
             except Exception:
@@ -161,7 +273,11 @@ def fetch_market_data(force_refresh=False):
 
     summary_df = pd.DataFrame(summary_all)
     summary_df = summary_df.loc[:, ~summary_df.columns.duplicated()].copy()
+    summary_df = summary_df.sort_values(["Symbol", "Date"], ascending=[True, False])
     summary_df = summary_df.drop_duplicates(subset=["Symbol"], keep="first").reset_index(drop=True)
+    summary_df = summary_df.sort_values("Symbol").reset_index(drop=True)
+
+    export_outputs(summary_df)
 
     index_df = pd.DataFrame()
 
