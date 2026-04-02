@@ -151,43 +151,8 @@ def fetch_index_summaries():
     return idx_df
 
 
-def should_use_cache(force_refresh: bool = False) -> bool:
-    if force_refresh:
-        return False
-
-    if not (CACHE_FILE.exists() and SUMMARY_FILE.exists() and INDEX_SUMMARY_FILE.exists()):
-        return False
-
-    if not os.path.exists(SYMBOLS_FILE):
-        return True
-
-    symbols_last_modified = os.path.getmtime(SYMBOLS_FILE)
-    cache_last_modified = os.path.getmtime(CACHE_FILE)
-
-    return cache_last_modified >= symbols_last_modified
-
-
-def load_cached_data():
-    raw = pd.read_parquet(CACHE_FILE)
-    summary = pd.read_parquet(SUMMARY_FILE)
-    idx_summary = pd.read_parquet(INDEX_SUMMARY_FILE)
-
-    raw = raw.loc[:, ~raw.columns.duplicated()].copy()
-    summary = summary.loc[:, ~summary.columns.duplicated()].copy()
-    idx_summary = idx_summary.loc[:, ~idx_summary.columns.duplicated()].copy()
-
-    meta = {}
-    if META_FILE.exists():
-        meta = json.loads(META_FILE.read_text())
-
-    return raw, summary, idx_summary, meta
-
-
 def fetch_market_data(force_refresh: bool = False):
     symbols = load_symbols()
-
-    if should_use_cache(force_refresh=force_refresh):
-        return load_cached_data()
 
     raw_frames_all = []
     summary_rows_all = []
@@ -204,15 +169,6 @@ def fetch_market_data(force_refresh: bool = False):
     success_ratio = (success_count / total_symbols) if total_symbols else 0
 
     if success_count == 0 or success_ratio < MIN_SUCCESS_RATIO:
-        if CACHE_FILE.exists() and SUMMARY_FILE.exists() and INDEX_SUMMARY_FILE.exists():
-            raw, summary, idx_summary, meta = load_cached_data()
-            meta["used_fallback"] = True
-            meta["refresh_attempt_failed"] = True
-            meta["symbols_loaded"] = total_symbols
-            meta["symbols_succeeded"] = success_count
-            meta["success_ratio"] = round(success_ratio, 4)
-            return raw, summary, idx_summary, meta
-
         raise RuntimeError(
             f"Too few symbols fetched successfully. Success: {success_count}/{total_symbols}"
         )
@@ -254,34 +210,3 @@ def fetch_market_data(force_refresh: bool = False):
     META_FILE.write_text(json.dumps(meta, indent=2))
 
     return raw, summary, idx_summary, meta
-
-
-def compute_relative_strength(summary_df: pd.DataFrame, index_df: pd.DataFrame, benchmark_name: str):
-    out = summary_df.copy()
-
-    if index_df.empty:
-        out["RS_1D_vs_Benchmark"] = None
-        out["RS_21D_vs_Benchmark"] = None
-        out["RS_55D_vs_Benchmark"] = None
-        out["RS_123D_vs_Benchmark"] = None
-        out["RS_180D_vs_Benchmark"] = None
-        return out
-
-    bench = index_df[index_df["Index"] == benchmark_name]
-    if bench.empty:
-        out["RS_1D_vs_Benchmark"] = None
-        out["RS_21D_vs_Benchmark"] = None
-        out["RS_55D_vs_Benchmark"] = None
-        out["RS_123D_vs_Benchmark"] = None
-        out["RS_180D_vs_Benchmark"] = None
-        return out
-
-    bench_row = bench.iloc[0]
-
-    out["RS_1D_vs_Benchmark"] = out["RET_1D"] - bench_row.get("RET_1D", 0)
-    out["RS_21D_vs_Benchmark"] = out["RET_21D"] - bench_row.get("RET_21D", 0)
-    out["RS_55D_vs_Benchmark"] = out["RET_55D"] - bench_row.get("RET_55D", 0)
-    out["RS_123D_vs_Benchmark"] = out["RET_123D"] - bench_row.get("RET_123D", 0)
-    out["RS_180D_vs_Benchmark"] = out["RET_180D"] - bench_row.get("RET_180D", 0)
-
-    return out
