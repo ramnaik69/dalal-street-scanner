@@ -1,0 +1,37 @@
+name: Daily Market Update
+
+on:
+  schedule:
+    # 17:10 IST = 11:40 UTC
+    - cron: '40 11 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  update-market-data:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run updater
+        run: |
+          python updater.py
+
+      - name: Commit updated cache files
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git add data/*.parquet data/*.json || true
+          git diff --cached --quiet || git commit -m "Daily market data update"
+          git push
