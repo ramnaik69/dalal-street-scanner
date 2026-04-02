@@ -9,6 +9,7 @@ INDEX_SUMMARY_FILE = DATA_DIR / "index_summary_cache.parquet"
 META_FILE = DATA_DIR / "meta.json"
 
 SYMBOLS_FILE = "symbols.csv"
+COMPANY_MASTER_FILE = "company_master.csv"
 
 INDEX_MAP = {
     "NIFTY 50": "^NSEI",
