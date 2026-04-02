@@ -6,15 +6,17 @@ st.title("📊 Dalal Street Scanner (Multi Timeframe)")
 st.warning("APP VERSION: CLEAN-2026-04-02-V1")
 
 @st.cache_data(ttl=60)
-def load_data(force=False):
-    return fetch_market_data(force_refresh=force)
+def load_data():
+    return fetch_market_data(force_refresh=False)
 
-refresh = st.button("🔄 Refresh Data")
+if st.button("🔄 Reload 5PM Snapshot"):
+    st.cache_data.clear()
 
-raw_df, summary_df, index_df, meta = load_data(force=refresh)
+raw_df, summary_df, index_df, meta = load_data()
 
 st.caption(
     f"Last Refresh: {meta.get('last_refresh')} | "
+    f"Mode: {meta.get('data_mode', 'snapshot')} | "
     f"Stocks Loaded: {meta.get('symbols_loaded')} | "
     f"Stocks Succeeded: {meta.get('symbols_succeeded')}"
 )

@@ -3,22 +3,24 @@ from data_fetcher import fetch_market_data
 
 st.set_page_config(page_title="Dalal Street Scanner V2", layout="wide")
 st.title("📊 Dalal Street Scanner (Multi Timeframe)")
-st.warning("APP VERSION: V2-FRESH-DEPLOY")
+st.warning("APP VERSION: V2-EOD-SNAPSHOT")
 
 @st.cache_data(ttl=30)
-def load_data(force=False):
-    return fetch_market_data(force_refresh=force)
+def load_data():
+    return fetch_market_data(force_refresh=False)
 
-refresh = st.button("🔄 Refresh Data")
+if st.button("🔄 Reload 5PM Snapshot"):
+    st.cache_data.clear()
 
 try:
-    raw_df, summary_df, index_df, meta = load_data(force=refresh)
+    raw_df, summary_df, index_df, meta = load_data()
 except Exception as e:
     st.error(f"Fresh deploy is running, but data load failed with: {str(e)}")
     st.stop()
 
 st.caption(
     f"Last Refresh: {meta.get('last_refresh')} | "
+    f"Mode: {meta.get('data_mode', 'snapshot')} | "
     f"Stocks Loaded: {meta.get('symbols_loaded')} | "
     f"Stocks Succeeded: {meta.get('symbols_succeeded')}"
 )

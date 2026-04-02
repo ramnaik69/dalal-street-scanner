@@ -2,16 +2,26 @@ import pandas as pd
 import yfinance as yf
 import numpy as np
 import requests
+import json
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from config import SYMBOLS_FILE, HISTORY_PERIOD, INTERVAL
+from config import (
+    SYMBOLS_FILE,
+    HISTORY_PERIOD,
+    INTERVAL,
+    CACHE_FILE,
+    SUMMARY_FILE,
+    INDEX_SUMMARY_FILE,
+    META_FILE,
+)
 from indicators import build_latest_summary
 
 
 BULK_BATCH_SIZE = 80
 HISTORY_WORKERS = 6
 FUNDAMENTAL_WORKERS = 12
+ENABLE_FUNDAMENTALS = False
 
 INDEX_ENDPOINTS = {
     "NIFTY50": "NIFTY 50",
@@ -184,6 +194,26 @@ def export_outputs(summary_df):
     export_df.to_html("data/screener_latest.html", index=False)
 
 
+def load_cached_outputs():
+    if not SUMMARY_FILE.exists() or not META_FILE.exists():
+        return None
+
+    raw_df = pd.read_parquet(CACHE_FILE) if CACHE_FILE.exists() else pd.DataFrame()
+    summary_df = pd.read_parquet(SUMMARY_FILE)
+    index_df = pd.read_parquet(INDEX_SUMMARY_FILE) if INDEX_SUMMARY_FILE.exists() else pd.DataFrame()
+    with open(META_FILE, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    return raw_df, summary_df, index_df, meta
+
+
+def save_cached_outputs(raw_df, summary_df, index_df, meta):
+    raw_df.to_parquet(CACHE_FILE, index=False)
+    summary_df.to_parquet(SUMMARY_FILE, index=False)
+    index_df.to_parquet(INDEX_SUMMARY_FILE, index=False)
+    with open(META_FILE, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+
 def extract_symbol_df(bulk_df, yahoo_symbol):
     if bulk_df is None or bulk_df.empty:
         return pd.DataFrame()
@@ -204,6 +234,14 @@ def extract_symbol_df(bulk_df, yahoo_symbol):
 
 
 def fetch_market_data(force_refresh=False):
+    if not force_refresh:
+        cached = load_cached_outputs()
+        if cached is not None:
+            return cached
+        raise RuntimeError(
+            "No cached EOD snapshot found yet. Run `python updater.py` after 5:00 PM IST on a trading day."
+        )
+
     symbols = load_symbols()
 
     raw_all = []
@@ -221,7 +259,11 @@ def fetch_market_data(force_refresh=False):
     yahoo_symbols = symbols["YahooSymbol"].tolist()
 
     index_membership = load_index_membership()
-    fundamentals_map = fetch_fundamentals_map(yahoo_symbols)
+    fundamentals_map = (
+        fetch_fundamentals_map(yahoo_symbols)
+        if ENABLE_FUNDAMENTALS
+        else {ys: {"MarketCap": np.nan, "EPS": np.nan, "BookValue": np.nan} for ys in yahoo_symbols}
+    )
 
     batches = list(chunk_list(yahoo_symbols, BULK_BATCH_SIZE))
     with ThreadPoolExecutor(max_workers=HISTORY_WORKERS) as executor:
@@ -286,8 +328,10 @@ def fetch_market_data(force_refresh=False):
         "symbols_loaded": total_symbols,
         "symbols_succeeded": success_count,
         "batch_size": BULK_BATCH_SIZE,
+        "data_mode": "EOD snapshot (post-close)",
     }
 
+    save_cached_outputs(raw_df, summary_df, index_df, meta)
     return raw_df, summary_df, index_df, meta
 
 
