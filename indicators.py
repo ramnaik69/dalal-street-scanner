@@ -1,7 +1,9 @@
 import numpy as np
 import pandas as pd
 import ta
+
 from config import RETURN_WINDOWS, VOLUME_WINDOWS
+
 
 def safe_numeric(df, cols):
     for c in cols:
@@ -9,9 +11,21 @@ def safe_numeric(df, cols):
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy().sort_values("Date").reset_index(drop=True)
+    df = df.copy()
+
+    # remove duplicate columns if any
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    # ensure date
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+
     df = safe_numeric(df, ["Open", "High", "Low", "Close", "Volume"])
+
+    # drop duplicate dates
+    df = df.drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
 
     for w in [13, 21, 50, 100, 200]:
         df[f"EMA_{w}"] = df["Close"].ewm(span=w, adjust=False).mean()
@@ -43,12 +57,15 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df[f"VOL_VS_{w}"] = np.where(avg > 0, df["Volume"] / avg, np.nan)
 
     df["Year"] = df["Date"].dt.year
-    jan_df = df[df["Date"].dt.month == 1].groupby("Year").agg(
-        JAN_HIGH=("High", "max"),
-        JAN_LOW=("Low", "min")
-    ).reset_index()
+
+    jan_df = (
+        df[df["Date"].dt.month == 1]
+        .groupby("Year", as_index=False)
+        .agg(JAN_HIGH=("High", "max"), JAN_LOW=("Low", "min"))
+    )
 
     df = df.merge(jan_df, on="Year", how="left")
+
     df["Above_Jan_High"] = df["Close"] > df["JAN_HIGH"]
     df["Below_Jan_Low"] = df["Close"] < df["JAN_LOW"]
 
@@ -56,17 +73,23 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     prev_low = df["Low"].shift(1)
     prev_close = df["Close"].shift(1)
 
-    df["PIVOT_D"] = (prev_high + prev_low + prev_close) / 3
+    df["PIVOT_D"] = (prev_high + prev_low + prev_close) / 3.0
     df["R1_D"] = 2 * df["PIVOT_D"] - prev_low
     df["S1_D"] = 2 * df["PIVOT_D"] - prev_high
     df["R2_D"] = df["PIVOT_D"] + (prev_high - prev_low)
     df["S2_D"] = df["PIVOT_D"] - (prev_high - prev_low)
 
     df["Above_200_SMA"] = df["Close"] > df["SMA_200"]
+
     return df
+
 
 def build_latest_summary(symbol: str, name: str, exchange: str, df: pd.DataFrame) -> dict:
     df = add_indicators(df)
+
+    if df.empty:
+        return {}
+
     last = df.iloc[-1]
 
     row = {
@@ -74,22 +97,31 @@ def build_latest_summary(symbol: str, name: str, exchange: str, df: pd.DataFrame
         "Name": name,
         "Exchange": exchange,
         "Date": last["Date"],
-        "Close": round(float(last["Close"]), 2),
-        "EMA_13": round(float(last["EMA_13"]), 2),
-        "EMA_21": round(float(last["EMA_21"]), 2),
-        "EMA_50": round(float(last["EMA_50"]), 2),
-        "EMA_100": round(float(last["EMA_100"]), 2),
-        "EMA_200": round(float(last["EMA_200"]), 2),
-        "SMA_200": round(float(last["SMA_200"]), 2),
-        "Above_200_SMA": bool(last["Above_200_SMA"]),
+        "Close": round(float(last["Close"]), 2) if pd.notna(last["Close"]) else np.nan,
+
+        "EMA_13": round(float(last["EMA_13"]), 2) if pd.notna(last["EMA_13"]) else np.nan,
+        "EMA_21": round(float(last["EMA_21"]), 2) if pd.notna(last["EMA_21"]) else np.nan,
+        "EMA_50": round(float(last["EMA_50"]), 2) if pd.notna(last["EMA_50"]) else np.nan,
+        "EMA_100": round(float(last["EMA_100"]), 2) if pd.notna(last["EMA_100"]) else np.nan,
+        "EMA_200": round(float(last["EMA_200"]), 2) if pd.notna(last["EMA_200"]) else np.nan,
+        "SMA_200": round(float(last["SMA_200"]), 2) if pd.notna(last["SMA_200"]) else np.nan,
+
+        "Above_200_SMA": bool(last["Above_200_SMA"]) if pd.notna(last["Above_200_SMA"]) else False,
+
         "RSI_D": round(float(last["RSI_D"]), 2) if pd.notna(last["RSI_D"]) else np.nan,
         "ADX_D": round(float(last["ADX_D"]), 2) if pd.notna(last["ADX_D"]) else np.nan,
         "MACD_D": round(float(last["MACD_D"]), 4) if pd.notna(last["MACD_D"]) else np.nan,
+
         "JAN_HIGH": round(float(last["JAN_HIGH"]), 2) if pd.notna(last["JAN_HIGH"]) else np.nan,
         "JAN_LOW": round(float(last["JAN_LOW"]), 2) if pd.notna(last["JAN_LOW"]) else np.nan,
         "Above_Jan_High": bool(last["Above_Jan_High"]) if pd.notna(last["Above_Jan_High"]) else False,
         "Below_Jan_Low": bool(last["Below_Jan_Low"]) if pd.notna(last["Below_Jan_Low"]) else False,
+
         "PIVOT_D": round(float(last["PIVOT_D"]), 2) if pd.notna(last["PIVOT_D"]) else np.nan,
+        "R1_D": round(float(last["R1_D"]), 2) if pd.notna(last["R1_D"]) else np.nan,
+        "S1_D": round(float(last["S1_D"]), 2) if pd.notna(last["S1_D"]) else np.nan,
+        "R2_D": round(float(last["R2_D"]), 2) if pd.notna(last["R2_D"]) else np.nan,
+        "S2_D": round(float(last["S2_D"]), 2) if pd.notna(last["S2_D"]) else np.nan,
     }
 
     for w in RETURN_WINDOWS:
