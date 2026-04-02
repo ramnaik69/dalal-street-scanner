@@ -1,6 +1,5 @@
 import json
 import os
-import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -20,9 +19,8 @@ from config import (
 )
 from indicators import build_latest_summary, add_indicators
 
-
-BATCH_SIZE = 150
-MIN_SUCCESS_RATIO = 0.20  # accept refresh if at least 20% symbols succeed
+BATCH_SIZE = 100
+MIN_SUCCESS_RATIO = 0.10
 
 
 def load_symbols():
@@ -30,12 +28,6 @@ def load_symbols():
     df = df.loc[:, ~df.columns.duplicated()]
     df = df.drop_duplicates(subset=["Symbol"], keep="first").reset_index(drop=True)
     return df
-
-
-def chunk_dataframe(df: pd.DataFrame, batch_size: int):
-    total = len(df)
-    for start in range(0, total, batch_size):
-        yield df.iloc[start:start + batch_size].copy()
 
 
 def fetch_one(yahoo_symbol: str) -> pd.DataFrame:
@@ -67,13 +59,13 @@ def fetch_one(yahoo_symbol: str) -> pd.DataFrame:
 
         needed = ["Date", "Open", "High", "Low", "Close", "Volume"]
         keep = [c for c in needed if c in df.columns]
-
         if len(keep) < 6:
             return pd.DataFrame()
 
         out = df[keep].copy()
         out = out.loc[:, ~out.columns.duplicated()]
         return out
+
     except Exception:
         return pd.DataFrame()
 
@@ -109,7 +101,6 @@ def fetch_batch(batch_df: pd.DataFrame):
                     row.Exchange,
                     df[["Date", "Open", "High", "Low", "Close", "Volume"]].copy(),
                 )
-
                 if summary_row:
                     summary_rows.append(summary_row)
 
@@ -149,11 +140,13 @@ def fetch_index_summaries():
                 "RET_180D": round(float(last["RET_180D"]), 2) if pd.notna(last["RET_180D"]) else None,
             }
             rows.append(row)
+
         except Exception:
             continue
 
     idx_df = pd.DataFrame(rows)
     if not idx_df.empty:
+        idx_df = idx_df.loc[:, ~idx_df.columns.duplicated()]
         idx_df = idx_df.drop_duplicates(subset=["Index"], keep="first").reset_index(drop=True)
     return idx_df
 
@@ -165,8 +158,11 @@ def should_use_cache(force_refresh: bool = False) -> bool:
     if not (CACHE_FILE.exists() and SUMMARY_FILE.exists() and INDEX_SUMMARY_FILE.exists()):
         return False
 
-    symbols_last_modified = os.path.getmtime(SYMBOLS_FILE) if os.path.exists(SYMBOLS_FILE) else 0
-    cache_last_modified = os.path.getmtime(CACHE_FILE) if CACHE_FILE.exists() else 0
+    if not os.path.exists(SYMBOLS_FILE):
+        return True
+
+    symbols_last_modified = os.path.getmtime(SYMBOLS_FILE)
+    cache_last_modified = os.path.getmtime(CACHE_FILE)
 
     return cache_last_modified >= symbols_last_modified
 
@@ -183,6 +179,7 @@ def load_cached_data():
     meta = {}
     if META_FILE.exists():
         meta = json.loads(META_FILE.read_text())
+
     return raw, summary, idx_summary, meta
 
 
@@ -195,16 +192,15 @@ def fetch_market_data(force_refresh: bool = False):
     raw_frames_all = []
     summary_rows_all = []
 
-    batches = list(chunk_dataframe(symbols, BATCH_SIZE))
-    total_batches = len(batches)
+    total_symbols = len(symbols)
 
-    for i, batch_df in enumerate(batches, start=1):
+    for start in range(0, total_symbols, BATCH_SIZE):
+        batch_df = symbols.iloc[start:start + BATCH_SIZE].copy()
         raw_frames, summary_rows = fetch_batch(batch_df)
         raw_frames_all.extend(raw_frames)
         summary_rows_all.extend(summary_rows)
 
     success_count = len(summary_rows_all)
-    total_symbols = len(symbols)
     success_ratio = (success_count / total_symbols) if total_symbols else 0
 
     if success_count == 0 or success_ratio < MIN_SUCCESS_RATIO:
@@ -214,6 +210,7 @@ def fetch_market_data(force_refresh: bool = False):
             meta["refresh_attempt_failed"] = True
             meta["symbols_loaded"] = total_symbols
             meta["symbols_succeeded"] = success_count
+            meta["success_ratio"] = round(success_ratio, 4)
             return raw, summary, idx_summary, meta
 
         raise RuntimeError(
@@ -231,8 +228,15 @@ def fetch_market_data(force_refresh: bool = False):
 
     idx_summary = fetch_index_summaries()
     if idx_summary.empty:
-        idx_summary = pd.DataFrame(columns=["Index", "Ticker", "Date", "Close", "RSI_D", "ADX_D", "PIVOT_D"])
+        idx_summary = pd.DataFrame(
+            columns=[
+                "Index", "Ticker", "Date", "Close",
+                "RSI_D", "ADX_D", "PIVOT_D",
+                "RET_1D", "RET_21D", "RET_55D", "RET_123D", "RET_180D"
+            ]
+        )
 
+    os.makedirs(CACHE_FILE.parent, exist_ok=True)
     raw.to_parquet(CACHE_FILE, index=False)
     summary.to_parquet(SUMMARY_FILE, index=False)
     idx_summary.to_parquet(INDEX_SUMMARY_FILE, index=False)
@@ -246,7 +250,6 @@ def fetch_market_data(force_refresh: bool = False):
         "symbols_succeeded": int(success_count),
         "success_ratio": round(success_ratio, 4),
         "batch_size": BATCH_SIZE,
-        "total_batches": total_batches,
     }
     META_FILE.write_text(json.dumps(meta, indent=2))
 
