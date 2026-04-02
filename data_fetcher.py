@@ -1,5 +1,6 @@
 import json
 import os
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -20,6 +21,10 @@ from config import (
 from indicators import build_latest_summary, add_indicators
 
 
+BATCH_SIZE = 150
+MIN_SUCCESS_RATIO = 0.20  # accept refresh if at least 20% symbols succeed
+
+
 def load_symbols():
     df = pd.read_csv(SYMBOLS_FILE)
     df = df.loc[:, ~df.columns.duplicated()]
@@ -27,38 +32,91 @@ def load_symbols():
     return df
 
 
+def chunk_dataframe(df: pd.DataFrame, batch_size: int):
+    total = len(df)
+    for start in range(0, total, batch_size):
+        yield df.iloc[start:start + batch_size].copy()
+
+
 def fetch_one(yahoo_symbol: str) -> pd.DataFrame:
-    df = yf.download(
-        yahoo_symbol,
-        period=HISTORY_PERIOD,
-        interval=INTERVAL,
-        progress=False,
-        auto_adjust=False,
-        threads=False,
-    )
+    try:
+        df = yf.download(
+            yahoo_symbol,
+            period=HISTORY_PERIOD,
+            interval=INTERVAL,
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+        )
 
-    if df is None or df.empty:
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df = df.reset_index()
+        df = df.loc[:, ~df.columns.duplicated()]
+
+        if "Date" not in df.columns:
+            return pd.DataFrame()
+
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"])
+        df = df.drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
+
+        needed = ["Date", "Open", "High", "Low", "Close", "Volume"]
+        keep = [c for c in needed if c in df.columns]
+
+        if len(keep) < 6:
+            return pd.DataFrame()
+
+        out = df[keep].copy()
+        out = out.loc[:, ~out.columns.duplicated()]
+        return out
+    except Exception:
         return pd.DataFrame()
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
 
-    df = df.reset_index()
-    df = df.loc[:, ~df.columns.duplicated()]
+def fetch_batch(batch_df: pd.DataFrame):
+    raw_frames = []
+    summary_rows = []
 
-    if "Date" not in df.columns:
-        return pd.DataFrame()
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        future_map = {
+            ex.submit(fetch_one, row.YahooSymbol): row
+            for row in batch_df.itertuples(index=False)
+        }
 
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df = df.dropna(subset=["Date"])
-    df = df.drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
+        for future in as_completed(future_map):
+            row = future_map[future]
+            try:
+                df = future.result()
+                if df.empty:
+                    continue
 
-    needed = ["Date", "Open", "High", "Low", "Close", "Volume"]
-    keep = [c for c in needed if c in df.columns]
+                df["Symbol"] = row.Symbol
+                df["YahooSymbol"] = row.YahooSymbol
+                df["Name"] = row.Name
+                df["Exchange"] = row.Exchange
+                df = df.loc[:, ~df.columns.duplicated()]
 
-    out = df[keep].copy()
-    out = out.loc[:, ~out.columns.duplicated()]
-    return out
+                raw_frames.append(df)
+
+                summary_row = build_latest_summary(
+                    row.Symbol,
+                    row.Name,
+                    row.Exchange,
+                    df[["Date", "Open", "High", "Low", "Close", "Volume"]].copy(),
+                )
+
+                if summary_row:
+                    summary_rows.append(summary_row)
+
+            except Exception:
+                continue
+
+    return raw_frames, summary_rows
 
 
 def fetch_index_summaries():
@@ -110,89 +168,63 @@ def should_use_cache(force_refresh: bool = False) -> bool:
     symbols_last_modified = os.path.getmtime(SYMBOLS_FILE) if os.path.exists(SYMBOLS_FILE) else 0
     cache_last_modified = os.path.getmtime(CACHE_FILE) if CACHE_FILE.exists() else 0
 
-    # Use cache only if cache is newer than or equal to symbols.csv
     return cache_last_modified >= symbols_last_modified
+
+
+def load_cached_data():
+    raw = pd.read_parquet(CACHE_FILE)
+    summary = pd.read_parquet(SUMMARY_FILE)
+    idx_summary = pd.read_parquet(INDEX_SUMMARY_FILE)
+
+    raw = raw.loc[:, ~raw.columns.duplicated()].copy()
+    summary = summary.loc[:, ~summary.columns.duplicated()].copy()
+    idx_summary = idx_summary.loc[:, ~idx_summary.columns.duplicated()].copy()
+
+    meta = {}
+    if META_FILE.exists():
+        meta = json.loads(META_FILE.read_text())
+    return raw, summary, idx_summary, meta
 
 
 def fetch_market_data(force_refresh: bool = False):
     symbols = load_symbols()
 
     if should_use_cache(force_refresh=force_refresh):
-        raw = pd.read_parquet(CACHE_FILE)
-        summary = pd.read_parquet(SUMMARY_FILE)
-        idx_summary = pd.read_parquet(INDEX_SUMMARY_FILE)
+        return load_cached_data()
 
-        raw = raw.loc[:, ~raw.columns.duplicated()].copy()
-        summary = summary.loc[:, ~summary.columns.duplicated()].copy()
-        idx_summary = idx_summary.loc[:, ~idx_summary.columns.duplicated()].copy()
+    raw_frames_all = []
+    summary_rows_all = []
 
-        meta = {}
-        if META_FILE.exists():
-            meta = json.loads(META_FILE.read_text())
-        return raw, summary, idx_summary, meta
+    batches = list(chunk_dataframe(symbols, BATCH_SIZE))
+    total_batches = len(batches)
 
-    raw_frames = []
-    summary_rows = []
+    for i, batch_df in enumerate(batches, start=1):
+        raw_frames, summary_rows = fetch_batch(batch_df)
+        raw_frames_all.extend(raw_frames)
+        summary_rows_all.extend(summary_rows)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        future_map = {}
+    success_count = len(summary_rows_all)
+    total_symbols = len(symbols)
+    success_ratio = (success_count / total_symbols) if total_symbols else 0
 
-        for row in symbols.itertuples(index=False):
-            future = ex.submit(fetch_one, row.YahooSymbol)
-            future_map[future] = row
-
-        for future in as_completed(future_map):
-            row = future_map[future]
-            try:
-                df = future.result()
-                if df.empty:
-                    continue
-
-                df["Symbol"] = row.Symbol
-                df["YahooSymbol"] = row.YahooSymbol
-                df["Name"] = row.Name
-                df["Exchange"] = row.Exchange
-
-                df = df.loc[:, ~df.columns.duplicated()]
-                raw_frames.append(df)
-
-                summary_row = build_latest_summary(
-                    row.Symbol,
-                    row.Name,
-                    row.Exchange,
-                    df[["Date", "Open", "High", "Low", "Close", "Volume"]].copy(),
-                )
-
-                if summary_row:
-                    summary_rows.append(summary_row)
-
-            except Exception:
-                continue
-
-    if not raw_frames or not summary_rows:
-        # fallback to old cache if available
+    if success_count == 0 or success_ratio < MIN_SUCCESS_RATIO:
         if CACHE_FILE.exists() and SUMMARY_FILE.exists() and INDEX_SUMMARY_FILE.exists():
-            raw = pd.read_parquet(CACHE_FILE)
-            summary = pd.read_parquet(SUMMARY_FILE)
-            idx_summary = pd.read_parquet(INDEX_SUMMARY_FILE)
-
-            raw = raw.loc[:, ~raw.columns.duplicated()].copy()
-            summary = summary.loc[:, ~summary.columns.duplicated()].copy()
-            idx_summary = idx_summary.loc[:, ~idx_summary.columns.duplicated()].copy()
-
-            meta = {}
-            if META_FILE.exists():
-                meta = json.loads(META_FILE.read_text())
+            raw, summary, idx_summary, meta = load_cached_data()
             meta["used_fallback"] = True
+            meta["refresh_attempt_failed"] = True
+            meta["symbols_loaded"] = total_symbols
+            meta["symbols_succeeded"] = success_count
             return raw, summary, idx_summary, meta
 
-        raise RuntimeError("No market data fetched.")
+        raise RuntimeError(
+            f"Too few symbols fetched successfully. Success: {success_count}/{total_symbols}"
+        )
 
-    raw = pd.concat(raw_frames, ignore_index=True)
+    raw = pd.concat(raw_frames_all, ignore_index=True)
     raw = raw.loc[:, ~raw.columns.duplicated()]
     raw = raw.reset_index(drop=True)
 
-    summary = pd.DataFrame(summary_rows)
+    summary = pd.DataFrame(summary_rows_all)
     summary = summary.loc[:, ~summary.columns.duplicated()]
     summary = summary.drop_duplicates(subset=["Symbol"], keep="first")
     summary = summary.sort_values(["Exchange", "Symbol"]).reset_index(drop=True)
@@ -210,7 +242,11 @@ def fetch_market_data(force_refresh: bool = False):
         "used_fallback": False,
         "rows_raw": int(len(raw)),
         "rows_summary": int(len(summary)),
-        "symbols_loaded": int(len(symbols)),
+        "symbols_loaded": int(total_symbols),
+        "symbols_succeeded": int(success_count),
+        "success_ratio": round(success_ratio, 4),
+        "batch_size": BATCH_SIZE,
+        "total_batches": total_batches,
     }
     META_FILE.write_text(json.dumps(meta, indent=2))
 
