@@ -53,6 +53,11 @@ def normalize_single_ticker_df(df):
     df = df.reset_index()
     df = df.loc[:, ~df.columns.duplicated()]
 
+    if "Date" not in df.columns and "Datetime" in df.columns:
+        df = df.rename(columns={"Datetime": "Date"})
+    if "Date" not in df.columns and len(df.columns) > 0 and df.columns[0] in {"index", "level_0"}:
+        df = df.rename(columns={df.columns[0]: "Date"})
+
     needed = ["Date", "Open", "High", "Low", "Close", "Volume"]
     keep = [c for c in needed if c in df.columns]
 
@@ -82,20 +87,48 @@ def bulk_download_chunk(yahoo_symbols):
         return pd.DataFrame()
 
 
+def single_download_symbol(yahoo_symbol):
+    try:
+        data = yf.download(
+            tickers=yahoo_symbol,
+            period=HISTORY_PERIOD,
+            interval=INTERVAL,
+            progress=False,
+            auto_adjust=False,
+            group_by="ticker",
+            threads=False,
+        )
+        return normalize_single_ticker_df(data)
+    except Exception:
+        return pd.DataFrame()
+
+
 def extract_symbol_df(bulk_df, yahoo_symbol):
     if bulk_df is None or bulk_df.empty:
         return pd.DataFrame()
 
     # Multi-ticker response
     if isinstance(bulk_df.columns, pd.MultiIndex):
-        if yahoo_symbol not in bulk_df.columns.get_level_values(0):
-            return pd.DataFrame()
+        lvl0 = set(bulk_df.columns.get_level_values(0))
+        lvl1 = set(bulk_df.columns.get_level_values(1))
 
-        try:
-            df = bulk_df[yahoo_symbol].copy()
-            return normalize_single_ticker_df(df)
-        except Exception:
-            return pd.DataFrame()
+        # Typical yfinance multi-ticker format: (Ticker, PriceField)
+        if yahoo_symbol in lvl0:
+            try:
+                df = bulk_df[yahoo_symbol].copy()
+                return normalize_single_ticker_df(df)
+            except Exception:
+                return pd.DataFrame()
+
+        # Alternate format seen in some yfinance/pandas combinations: (PriceField, Ticker)
+        if yahoo_symbol in lvl1:
+            try:
+                df = bulk_df.xs(yahoo_symbol, axis=1, level=1).copy()
+                return normalize_single_ticker_df(df)
+            except Exception:
+                return pd.DataFrame()
+
+        return pd.DataFrame()
 
     # Single-ticker response
     return normalize_single_ticker_df(bulk_df)
@@ -125,6 +158,9 @@ def fetch_market_data(force_refresh=False):
             try:
                 df = extract_symbol_df(bulk_df, ys)
                 if df.empty:
+                    # Per-symbol fallback if bulk request is partial/empty.
+                    df = single_download_symbol(ys)
+                if df.empty:
                     continue
 
                 meta = symbol_map[ys]
@@ -151,11 +187,6 @@ def fetch_market_data(force_refresh=False):
     success_count = len(summary_all)
     total_symbols = len(symbols)
 
-    if success_count == 0:
-        raise RuntimeError(
-            "Bulk Yahoo loader ran, but zero symbols fetched successfully."
-        )
-
     raw_df = pd.concat(raw_all, ignore_index=True) if raw_all else pd.DataFrame()
     raw_df = raw_df.loc[:, ~raw_df.columns.duplicated()].copy()
 
@@ -171,6 +202,11 @@ def fetch_market_data(force_refresh=False):
         "symbols_succeeded": success_count,
         "batch_size": BULK_BATCH_SIZE,
     }
+    if success_count == 0:
+        meta["warning"] = (
+            "Yahoo loader finished, but zero symbols fetched successfully. "
+            "This usually indicates temporary Yahoo/network throttling."
+        )
 
     return raw_df, summary_df, index_df, meta
 
