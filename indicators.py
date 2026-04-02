@@ -14,17 +14,12 @@ def safe_numeric(df, cols):
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
-    # remove duplicate columns if any
     df = df.loc[:, ~df.columns.duplicated()]
 
-    # ensure date
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
 
     df = safe_numeric(df, ["Open", "High", "Low", "Close", "Volume"])
-
-    # drop duplicate dates
     df = df.drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
 
     for w in [13, 21, 50, 100, 200]:
@@ -57,13 +52,11 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df[f"VOL_VS_{w}"] = np.where(avg > 0, df["Volume"] / avg, np.nan)
 
     df["Year"] = df["Date"].dt.year
-
     jan_df = (
         df[df["Date"].dt.month == 1]
         .groupby("Year", as_index=False)
         .agg(JAN_HIGH=("High", "max"), JAN_LOW=("Low", "min"))
     )
-
     df = df.merge(jan_df, on="Year", how="left")
 
     df["Above_Jan_High"] = df["Close"] > df["JAN_HIGH"]
@@ -80,8 +73,93 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["S2_D"] = df["PIVOT_D"] - (prev_high - prev_low)
 
     df["Above_200_SMA"] = df["Close"] > df["SMA_200"]
-
     return df
+
+
+def compute_htf_metrics(df: pd.DataFrame):
+    x = df.copy().set_index("Date").sort_index()
+
+    weekly = x.resample("W-FRI").agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum"
+    }).dropna()
+
+    monthly = x.resample("M").agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum"
+    }).dropna()
+
+    out = {}
+
+    # Weekly
+    try:
+        out["RSI_W"] = ta.momentum.rsi(weekly["Close"], window=14).iloc[-1] if len(weekly) >= 14 else np.nan
+    except Exception:
+        out["RSI_W"] = np.nan
+
+    try:
+        out["ADX_W"] = ta.trend.adx(weekly["High"], weekly["Low"], weekly["Close"], window=14).iloc[-1] if len(weekly) >= 14 else np.nan
+    except Exception:
+        out["ADX_W"] = np.nan
+
+    try:
+        out["MACD_W"] = ta.trend.MACD(weekly["Close"]).macd().iloc[-1] if len(weekly) >= 26 else np.nan
+    except Exception:
+        out["MACD_W"] = np.nan
+
+    if len(weekly) >= 2:
+        ph, pl, pc = weekly["High"].iloc[-2], weekly["Low"].iloc[-2], weekly["Close"].iloc[-2]
+        p = (ph + pl + pc) / 3
+        out["PIVOT_W"] = p
+        out["R1_W"] = 2 * p - pl
+        out["S1_W"] = 2 * p - ph
+        out["R2_W"] = p + (ph - pl)
+        out["S2_W"] = p - (ph - pl)
+    else:
+        out["PIVOT_W"] = np.nan
+        out["R1_W"] = np.nan
+        out["S1_W"] = np.nan
+        out["R2_W"] = np.nan
+        out["S2_W"] = np.nan
+
+    # Monthly
+    try:
+        out["RSI_M"] = ta.momentum.rsi(monthly["Close"], window=14).iloc[-1] if len(monthly) >= 14 else np.nan
+    except Exception:
+        out["RSI_M"] = np.nan
+
+    try:
+        out["ADX_M"] = ta.trend.adx(monthly["High"], monthly["Low"], monthly["Close"], window=14).iloc[-1] if len(monthly) >= 14 else np.nan
+    except Exception:
+        out["ADX_M"] = np.nan
+
+    try:
+        out["MACD_M"] = ta.trend.MACD(monthly["Close"]).macd().iloc[-1] if len(monthly) >= 26 else np.nan
+    except Exception:
+        out["MACD_M"] = np.nan
+
+    if len(monthly) >= 2:
+        ph, pl, pc = monthly["High"].iloc[-2], monthly["Low"].iloc[-2], monthly["Close"].iloc[-2]
+        p = (ph + pl + pc) / 3
+        out["PIVOT_M"] = p
+        out["R1_M"] = 2 * p - pl
+        out["S1_M"] = 2 * p - ph
+        out["R2_M"] = p + (ph - pl)
+        out["S2_M"] = p - (ph - pl)
+    else:
+        out["PIVOT_M"] = np.nan
+        out["R1_M"] = np.nan
+        out["S1_M"] = np.nan
+        out["R2_M"] = np.nan
+        out["S2_M"] = np.nan
+
+    return out
 
 
 def build_latest_summary(symbol: str, name: str, exchange: str, df: pd.DataFrame) -> dict:
@@ -91,6 +169,7 @@ def build_latest_summary(symbol: str, name: str, exchange: str, df: pd.DataFrame
         return {}
 
     last = df.iloc[-1]
+    htf = compute_htf_metrics(df)
 
     row = {
         "Symbol": symbol,
@@ -123,6 +202,9 @@ def build_latest_summary(symbol: str, name: str, exchange: str, df: pd.DataFrame
         "R2_D": round(float(last["R2_D"]), 2) if pd.notna(last["R2_D"]) else np.nan,
         "S2_D": round(float(last["S2_D"]), 2) if pd.notna(last["S2_D"]) else np.nan,
     }
+
+    for key, val in htf.items():
+        row[key] = round(float(val), 4) if pd.notna(val) else np.nan
 
     for w in RETURN_WINDOWS:
         val = last.get(f"RET_{w}D", np.nan)
