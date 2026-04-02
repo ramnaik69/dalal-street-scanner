@@ -116,3 +116,10 @@ with tab4:
         rs_view = rs_view.sort_values("RS_55D_vs_Benchmark", ascending=False)
 
     st.dataframe(rs_view, use_container_width=True, height=500)
+
+    st.download_button(
+        "Download Relative Strength CSV",
+        rs_view.to_csv(index=False).encode("utf-8"),
+        "dalal_street_relative_strength.csv",
+        "text/csv"
+    )
