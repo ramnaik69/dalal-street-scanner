@@ -18,8 +18,9 @@ from config import (
 from indicators import build_latest_summary
 
 
-BULK_BATCH_SIZE = 80
-HISTORY_WORKERS = 6
+BULK_BATCH_SIZE = 20
+FALLBACK_BATCH_SIZE = 10
+HISTORY_WORKERS = 8
 FUNDAMENTAL_WORKERS = 12
 ENABLE_FUNDAMENTALS = False
 
@@ -109,6 +110,14 @@ def bulk_download_chunk(yahoo_symbols):
 
 def _fetch_single_chunk(batch):
     return batch, bulk_download_chunk(batch)
+
+
+def _download_with_retry(batch, retries=2):
+    for _ in range(retries + 1):
+        bulk_df = bulk_download_chunk(batch)
+        if bulk_df is not None and not bulk_df.empty:
+            return bulk_df
+    return pd.DataFrame()
 
 
 def load_index_membership():
@@ -238,9 +247,7 @@ def fetch_market_data(force_refresh=False):
         cached = load_cached_outputs()
         if cached is not None:
             return cached
-        raise RuntimeError(
-            "No cached EOD snapshot found yet. Run `python updater.py` after 5:00 PM IST on a trading day."
-        )
+        # First deploy or empty cache: fallback to live fetch path.
 
     symbols = load_symbols()
 
@@ -271,6 +278,41 @@ def fetch_market_data(force_refresh=False):
         batch_results = [f.result() for f in as_completed(futures)]
 
     for batch, bulk_df in batch_results:
+        if bulk_df is None or bulk_df.empty:
+            # Retry failed large batch as smaller 10-symbol chunks
+            small_batches = list(chunk_list(batch, FALLBACK_BATCH_SIZE))
+            for sb in small_batches:
+                bulk_df_sb = _download_with_retry(sb, retries=2)
+                if bulk_df_sb is None or bulk_df_sb.empty:
+                    continue
+                for ys in sb:
+                    try:
+                        df = extract_symbol_df(bulk_df_sb, ys)
+                        if df.empty:
+                            continue
+
+                        meta = symbol_map[ys]
+                        fundamentals = fundamentals_map.get(ys, {})
+                        df["Symbol"] = meta["Symbol"]
+                        df["Name"] = meta["Name"]
+                        df["Exchange"] = meta["Exchange"]
+                        raw_all.append(df)
+
+                        summary = build_latest_summary(
+                            meta["Symbol"],
+                            meta["Name"],
+                            meta["Exchange"],
+                            df[["Date", "Open", "High", "Low", "Close", "Volume"]].copy(),
+                            fundamentals=fundamentals,
+                        )
+                        if summary:
+                            for membership_col, symbols_set in index_membership.items():
+                                summary[membership_col] = meta["Symbol"] in symbols_set
+                            summary_all.append(summary)
+                    except Exception:
+                        continue
+            continue
+
         for ys in batch:
             try:
                 df = extract_symbol_df(bulk_df, ys)
@@ -306,9 +348,15 @@ def fetch_market_data(force_refresh=False):
     total_symbols = len(symbols)
 
     if success_count == 0:
-        raise RuntimeError(
-            "Bulk Yahoo loader ran, but zero symbols fetched successfully."
-        )
+        meta = {
+            "last_refresh": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "symbols_loaded": total_symbols,
+            "symbols_succeeded": 0,
+            "batch_size": BULK_BATCH_SIZE,
+            "data_mode": "Live fallback attempted (no symbols fetched)",
+            "error": "No symbols fetched from provider. Try again or run scheduled updater later.",
+        }
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), meta
 
     raw_df = pd.concat(raw_all, ignore_index=True) if raw_all else pd.DataFrame()
     raw_df = raw_df.loc[:, ~raw_df.columns.duplicated()].copy()

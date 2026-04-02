@@ -20,6 +20,8 @@ st.caption(
     f"Stocks Loaded: {meta.get('symbols_loaded')} | "
     f"Stocks Succeeded: {meta.get('symbols_succeeded')}"
 )
+if meta.get("error"):
+    st.warning(meta["error"])
 
 cols = [
     "Symbol", "Name", "Exchange", "Close",
