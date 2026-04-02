@@ -1,4 +1,5 @@
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -99,13 +100,32 @@ def fetch_index_summaries():
     return idx_df
 
 
+def should_use_cache(force_refresh: bool = False) -> bool:
+    if force_refresh:
+        return False
+
+    if not (CACHE_FILE.exists() and SUMMARY_FILE.exists() and INDEX_SUMMARY_FILE.exists()):
+        return False
+
+    symbols_last_modified = os.path.getmtime(SYMBOLS_FILE) if os.path.exists(SYMBOLS_FILE) else 0
+    cache_last_modified = os.path.getmtime(CACHE_FILE) if CACHE_FILE.exists() else 0
+
+    # Use cache only if cache is newer than or equal to symbols.csv
+    return cache_last_modified >= symbols_last_modified
+
+
 def fetch_market_data(force_refresh: bool = False):
     symbols = load_symbols()
 
-    if CACHE_FILE.exists() and SUMMARY_FILE.exists() and INDEX_SUMMARY_FILE.exists() and not force_refresh:
+    if should_use_cache(force_refresh=force_refresh):
         raw = pd.read_parquet(CACHE_FILE)
         summary = pd.read_parquet(SUMMARY_FILE)
         idx_summary = pd.read_parquet(INDEX_SUMMARY_FILE)
+
+        raw = raw.loc[:, ~raw.columns.duplicated()].copy()
+        summary = summary.loc[:, ~summary.columns.duplicated()].copy()
+        idx_summary = idx_summary.loc[:, ~idx_summary.columns.duplicated()].copy()
+
         meta = {}
         if META_FILE.exists():
             meta = json.loads(META_FILE.read_text())
@@ -150,6 +170,22 @@ def fetch_market_data(force_refresh: bool = False):
                 continue
 
     if not raw_frames or not summary_rows:
+        # fallback to old cache if available
+        if CACHE_FILE.exists() and SUMMARY_FILE.exists() and INDEX_SUMMARY_FILE.exists():
+            raw = pd.read_parquet(CACHE_FILE)
+            summary = pd.read_parquet(SUMMARY_FILE)
+            idx_summary = pd.read_parquet(INDEX_SUMMARY_FILE)
+
+            raw = raw.loc[:, ~raw.columns.duplicated()].copy()
+            summary = summary.loc[:, ~summary.columns.duplicated()].copy()
+            idx_summary = idx_summary.loc[:, ~idx_summary.columns.duplicated()].copy()
+
+            meta = {}
+            if META_FILE.exists():
+                meta = json.loads(META_FILE.read_text())
+            meta["used_fallback"] = True
+            return raw, summary, idx_summary, meta
+
         raise RuntimeError("No market data fetched.")
 
     raw = pd.concat(raw_frames, ignore_index=True)
@@ -174,6 +210,7 @@ def fetch_market_data(force_refresh: bool = False):
         "used_fallback": False,
         "rows_raw": int(len(raw)),
         "rows_summary": int(len(summary)),
+        "symbols_loaded": int(len(symbols)),
     }
     META_FILE.write_text(json.dumps(meta, indent=2))
 
