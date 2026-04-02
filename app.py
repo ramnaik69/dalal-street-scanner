@@ -19,6 +19,9 @@ st.caption(
     f"Stocks Succeeded: {meta.get('symbols_succeeded')}"
 )
 
+if meta.get("warning"):
+    st.warning(meta["warning"])
+
 cols = [
     "Symbol", "Name", "Exchange", "Close",
     "EMA_13", "EMA_21", "EMA_50", "EMA_100", "EMA_200",
