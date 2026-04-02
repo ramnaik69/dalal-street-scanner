@@ -1,42 +1,72 @@
+from __future__ import annotations
+
 import streamlit as st
-from data_fetcher import fetch_market_data
 
-st.set_page_config(page_title="Dalal Street Scanner", layout="wide")
-st.title("📊 Dalal Street Scanner (Multi Timeframe)")
-st.warning("APP VERSION: CLEAN-2026-04-02-V1")
+from data_loader import fetch_market_data
+from screener import build_focus_screener
 
-@st.cache_data(ttl=60)
-def load_data(force=False):
-    return fetch_market_data(force_refresh=force)
+st.set_page_config(page_title="DALAL STREET DON", layout="wide")
+st.title("🦁 DALAL STREET DON")
+st.caption("Nifty comprehensive screener with 90+ columns and focus strategy.")
 
-refresh = st.button("🔄 Refresh Data")
 
-raw_df, summary_df, index_df, meta = load_data(force=refresh)
+@st.cache_data(ttl=900)
+def load_data():
+    return fetch_market_data()
 
-st.caption(
-    f"Last Refresh: {meta.get('last_refresh')} | "
-    f"Stocks Loaded: {meta.get('symbols_loaded')} | "
-    f"Stocks Succeeded: {meta.get('symbols_succeeded')}"
-)
 
-cols = [
-    "Symbol", "Name", "Exchange", "Close",
-    "EMA_13", "EMA_21", "EMA_50", "EMA_100", "EMA_200",
-    "SMA_200", "Above_200_SMA",
-    "RSI_D", "ADX_D", "MACD_D", "PIVOT_D",
-    "RSI_W", "ADX_W", "MACD_W", "PIVOT_W",
-    "RSI_M", "ADX_M", "MACD_M", "PIVOT_M",
-]
-cols = [c for c in cols if c in summary_df.columns]
+if st.button("⟳ Refresh Data"):
+    st.cache_data.clear()
 
-view = summary_df[cols].copy()
+df = load_data()
 
-st.subheader("📋 Screener")
-st.dataframe(view, use_container_width=True, height=650)
+if df.empty:
+    st.error("No data fetched. Check symbols and internet connectivity.")
+    st.stop()
 
-st.download_button(
-    "Download Screener CSV",
-    view.to_csv(index=False).encode("utf-8"),
-    "multi_timeframe_screener.csv",
-    "text/csv"
-)
+st.success(f"Loaded {len(df)} unique symbols.")
+
+search = st.text_input("Search Symbol or Name")
+if search:
+    s = search.strip().upper()
+    df = df[df["Symbol"].str.contains(s, na=False) | df["Name"].str.upper().str.contains(s, na=False)]
+
+sector_options = ["All"] + sorted([x for x in df["Sector"].dropna().unique() if x])
+sector = st.selectbox("Sector", sector_options)
+if sector != "All":
+    df = df[df["Sector"] == sector]
+
+with st.expander("Quick Filters"):
+    near_high = st.checkbox("Within 15% of 52W high")
+    above_200 = st.checkbox("Above 200 SMA")
+    above_jan = st.checkbox("Above January High")
+
+if near_high:
+    df = df[df["15% Range"] == True]
+if above_200:
+    df = df[df["Above 200 SMA"] == True]
+if above_jan:
+    df = df[df["Above Jan High"] == True]
+
+focus_df = build_focus_screener(df)
+
+all_tab, focus_tab = st.tabs(["All Stocks", "Focus Screener"])
+
+with all_tab:
+    st.dataframe(df, use_container_width=True, height=650)
+    st.download_button(
+        "⬇ Download Full CSV",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name="nse_screener_full.csv",
+        mime="text/csv",
+    )
+
+with focus_tab:
+    st.metric("Matches", len(focus_df))
+    st.dataframe(focus_df, use_container_width=True, height=650)
+    st.download_button(
+        "⬇ Download Focus CSV",
+        data=focus_df.to_csv(index=False).encode("utf-8"),
+        file_name="nse_focus_screener.csv",
+        mime="text/csv",
+    )
