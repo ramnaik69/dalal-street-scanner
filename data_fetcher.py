@@ -163,3 +163,5 @@ def compute_relative_strength(summary_df: pd.DataFrame, index_df: pd.DataFrame, 
     out["RS_123D_vs_Benchmark"] = out["RET_123D"] - bench_row.get("RET_123D", 0)
     out["RS_180D_vs_Benchmark"] = out["RET_180D"] - bench_row.get("RET_180D", 0)
     return out
+
+if CACHE_FILE.exists() and SUMMARY_FILE.exists() and INDEX_SUMMARY_FILE.exists() and not force_refresh:
