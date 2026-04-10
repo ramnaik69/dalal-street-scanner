@@ -6,3 +6,4 @@ ta
 pyarrow
 openpyxl
 plotly
+import plotly.express as px
